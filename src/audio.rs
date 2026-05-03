@@ -1,12 +1,20 @@
-use std::io::BufReader;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use parking_lot::Mutex;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+
+/// Playback state that the UI can render without touching rodio internals.
+#[derive(Clone, Debug)]
+pub struct PlaybackInfo {
+    pub name: String,
+    pub position: Duration,
+    pub duration: Option<Duration>,
+}
 
 /// Represents a currently playing sound
 pub struct PlayingSound {
@@ -14,6 +22,7 @@ pub struct PlayingSound {
     pub sink: Sink,
     pub local_sink: Option<Sink>,
     pub base_volume: f32,
+    pub duration: Option<Duration>,
 }
 
 /// Core audio engine handling device output and playback
@@ -27,6 +36,25 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    fn estimate_duration(path: &Path) -> Option<Duration> {
+        let file = File::open(path).ok()?;
+        let source = Decoder::new(BufReader::new(file)).ok()?;
+        let sample_rate = source.sample_rate() as f64;
+        let channels = source.channels() as f64;
+
+        if sample_rate <= 0.0 || channels <= 0.0 {
+            return None;
+        }
+
+        let sample_count = source.count() as f64;
+        let seconds = sample_count / sample_rate / channels;
+        if seconds.is_finite() && seconds > 0.0 {
+            Some(Duration::from_secs_f64(seconds))
+        } else {
+            None
+        }
+    }
+
     /// Create a new AudioEngine targeting a specific output device by name.
     /// If `device_name` is None, uses the default output device.
     pub fn new(device_name: Option<&str>) -> Result<Self, String> {
@@ -78,15 +106,26 @@ impl AudioEngine {
     }
 
     /// Play an audio file, returning Ok on success
-    pub fn play(&self, path: &Path, name: &str, base_volume: f32, master_volume: f32, play_locally: bool, local_volume: f32) -> Result<(), String> {
+    pub fn play(
+        &self,
+        path: &Path,
+        name: &str,
+        base_volume: f32,
+        master_volume: f32,
+        play_locally: bool,
+        local_volume: f32,
+    ) -> Result<(), String> {
         let file = File::open(path)
             .map_err(|e| format!("Cannot open file '{}': {}", path.display(), e))?;
         let reader = BufReader::new(file);
         let source = Decoder::new(reader)
             .map_err(|e| format!("Cannot decode '{}': {}", path.display(), e))?;
+        let duration = source
+            .total_duration()
+            .or_else(|| Self::estimate_duration(path));
 
-        let sink = Sink::try_new(&self.stream_handle)
-            .map_err(|e| format!("Cannot create sink: {}", e))?;
+        let sink =
+            Sink::try_new(&self.stream_handle).map_err(|e| format!("Cannot create sink: {}", e))?;
 
         sink.set_volume(base_volume * master_volume);
         sink.append(source);
@@ -114,9 +153,90 @@ impl AudioEngine {
             sink,
             local_sink,
             base_volume,
+            duration,
         });
 
         Ok(())
+    }
+
+    fn seek_playing_sound(sound: &PlayingSound, position: Duration) -> Result<(), String> {
+        let target = sound
+            .duration
+            .map(|duration| position.min(duration))
+            .unwrap_or(position);
+
+        sound
+            .sink
+            .try_seek(target)
+            .map_err(|e| format!("Cannot seek '{}': {}", sound.name, e))?;
+
+        if let Some(ref local_sink) = sound.local_sink {
+            if let Err(e) = local_sink.try_seek(target) {
+                log::warn!("Failed to seek local copy of '{}': {}", sound.name, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Seek a currently playing sound to an exact position.
+    pub fn seek_by_name(&self, name: &str, position: Duration) -> Result<(), String> {
+        let playing = self.playing.lock();
+        let mut found = false;
+        let mut first_error = None;
+
+        for sound in playing.iter().filter(|p| p.name == name) {
+            found = true;
+            if let Err(e) = Self::seek_playing_sound(sound, position) {
+                first_error.get_or_insert(e);
+            }
+        }
+
+        if !found {
+            return Err(format!("Sound '{}' is not playing", name));
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Move a currently playing sound forward or backward by a fixed amount.
+    pub fn seek_relative_by_name(
+        &self,
+        name: &str,
+        delta: Duration,
+        forward: bool,
+    ) -> Result<(), String> {
+        let playing = self.playing.lock();
+        let mut found = false;
+        let mut first_error = None;
+
+        for sound in playing.iter().filter(|p| p.name == name) {
+            found = true;
+            let current = sound.sink.get_pos();
+            let target = if forward {
+                current.checked_add(delta).unwrap_or(Duration::MAX)
+            } else {
+                current.saturating_sub(delta)
+            };
+
+            if let Err(e) = Self::seek_playing_sound(sound, target) {
+                first_error.get_or_insert(e);
+            }
+        }
+
+        if !found {
+            return Err(format!("Sound '{}' is not playing", name));
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Stop all currently playing sounds
@@ -124,7 +244,9 @@ impl AudioEngine {
         let mut playing = self.playing.lock();
         for p in playing.drain(..) {
             p.sink.stop();
-            if let Some(ls) = p.local_sink { ls.stop(); }
+            if let Some(ls) = p.local_sink {
+                ls.stop();
+            }
         }
     }
 
@@ -134,7 +256,9 @@ impl AudioEngine {
         if let Some(idx) = playing.iter().position(|p| p.name == name) {
             let p = playing.remove(idx);
             p.sink.stop();
-            if let Some(ls) = p.local_sink { ls.stop(); }
+            if let Some(ls) = p.local_sink {
+                ls.stop();
+            }
         }
     }
 
@@ -148,7 +272,13 @@ impl AudioEngine {
         }
     }
 
-    pub fn update_sound_volume(&self, name: &str, new_base_volume: f32, master_volume: f32, local_volume: f32) {
+    pub fn update_sound_volume(
+        &self,
+        name: &str,
+        new_base_volume: f32,
+        master_volume: f32,
+        local_volume: f32,
+    ) {
         let mut playing = self.playing.lock();
         for p in playing.iter_mut().filter(|p| p.name == name) {
             p.base_volume = new_base_volume;
@@ -166,15 +296,25 @@ impl AudioEngine {
         playing.iter().map(|p| p.name.clone()).collect()
     }
 
+    /// Get current playback positions for active sounds.
+    pub fn playback_snapshot(&self) -> Vec<PlaybackInfo> {
+        let mut playing = self.playing.lock();
+        playing.retain(|p| !p.sink.empty());
+        playing
+            .iter()
+            .map(|p| PlaybackInfo {
+                name: p.name.clone(),
+                position: p.sink.get_pos(),
+                duration: p.duration,
+            })
+            .collect()
+    }
+
     /// List all available output devices
     pub fn list_output_devices() -> Vec<String> {
         let host = cpal::default_host();
         host.output_devices()
-            .map(|devices| {
-                devices
-                    .filter_map(|d| d.name().ok())
-                    .collect()
-            })
+            .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
             .unwrap_or_default()
     }
 }

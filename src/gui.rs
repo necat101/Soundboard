@@ -1,11 +1,14 @@
 use eframe::egui;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::audio::AudioEngine;
+use crate::audio::{AudioEngine, PlaybackInfo};
 use crate::config::AppConfig;
 use crate::sound::{filter_sounds, FolderTab, SoundEntry};
+
+const SEEK_JUMP: Duration = Duration::from_secs(5);
 
 /// Main application state
 pub struct SoundboardApp {
@@ -14,7 +17,6 @@ pub struct SoundboardApp {
     search_query: String,
     available_devices: Vec<String>,
     selected_device_idx: usize,
-    show_settings: bool,
     status_message: String,
     needs_save: bool,
 }
@@ -34,31 +36,25 @@ impl SoundboardApp {
         visuals.faint_bg_color = egui::Color32::from_rgb(30, 30, 42);
         cc.egui_ctx.set_visuals(visuals);
 
-        // Set up fonts
         let mut style = (*cc.egui_ctx.style()).clone();
-        style.text_styles.insert(
-            egui::TextStyle::Heading,
-            egui::FontId::proportional(22.0),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Body,
-            egui::FontId::proportional(14.0),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Button,
-            egui::FontId::proportional(14.0),
-        );
-        style.text_styles.insert(
-            egui::TextStyle::Small,
-            egui::FontId::proportional(11.0),
-        );
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(22.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         cc.egui_ctx.set_style(style);
 
         let config = AppConfig::load();
         let available_devices = AudioEngine::list_output_devices();
 
-        // Initialize audio engine FIRST
         let engine = match AudioEngine::new(config.output_device.as_deref()) {
             Ok(e) => {
                 log::info!("Audio engine initialized: {}", e.device_name);
@@ -66,7 +62,6 @@ impl SoundboardApp {
             }
             Err(e) => {
                 log::error!("Failed to init audio engine: {}", e);
-                // Try default device
                 match AudioEngine::new(None) {
                     Ok(e) => Some(e),
                     Err(_) => None,
@@ -74,7 +69,6 @@ impl SoundboardApp {
             }
         };
 
-        // NOW sync selected_device_idx to the actual device that was initialized
         let selected_device_idx = if let Some(ref e) = engine {
             available_devices
                 .iter()
@@ -90,7 +84,6 @@ impl SoundboardApp {
             search_query: String::new(),
             available_devices,
             selected_device_idx,
-            show_settings: false,
             status_message: String::new(),
             needs_save: false,
         }
@@ -99,7 +92,14 @@ impl SoundboardApp {
     fn play_sound(&self, sound: &SoundEntry) {
         let engine = self.engine.lock();
         if let Some(ref engine) = *engine {
-            match engine.play(&sound.path, &sound.name, sound.volume, self.config.master_volume, self.config.play_locally, self.config.local_volume) {
+            match engine.play(
+                &sound.path,
+                &sound.name,
+                sound.volume,
+                self.config.master_volume,
+                self.config.play_locally,
+                self.config.local_volume,
+            ) {
                 Ok(()) => log::info!("Playing: {}", sound.name),
                 Err(e) => log::error!("Playback error: {}", e),
             }
@@ -129,46 +129,82 @@ impl SoundboardApp {
         }
     }
 
+    fn seek_sound_to(&mut self, sound_name: &str, seconds: f64) {
+        let result = {
+            let engine = self.engine.lock();
+            engine
+                .as_ref()
+                .map(|e| e.seek_by_name(sound_name, Duration::from_secs_f64(seconds.max(0.0))))
+        };
+
+        if let Some(Err(e)) = result {
+            self.status_message = e;
+        }
+    }
+
+    fn jump_sound(&mut self, sound_name: &str, forward: bool) {
+        let result = {
+            let engine = self.engine.lock();
+            engine
+                .as_ref()
+                .map(|e| e.seek_relative_by_name(sound_name, SEEK_JUMP, forward))
+        };
+
+        if let Some(Err(e)) = result {
+            self.status_message = e;
+        }
+    }
+
+    fn format_duration(duration: Duration) -> String {
+        let total = duration.as_secs();
+        let seconds = total % 60;
+        let minutes = (total / 60) % 60;
+        let hours = total / 3600;
+
+        if hours > 0 {
+            format!("{}:{:02}:{:02}", hours, minutes, seconds)
+        } else {
+            format!("{}:{:02}", minutes, seconds)
+        }
+    }
+
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // App title
-            ui.label(
-                egui::RichText::new("🔊 Soundboard")
-                    .size(20.0)
-                    .color(egui::Color32::from_rgb(140, 100, 255))
-                    .strong(),
-            );
-            ui.separator();
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Soundboard")
+                        .size(20.0)
+                        .color(egui::Color32::from_rgb(140, 100, 255))
+                        .strong(),
+                );
+                ui.separator();
 
-            // Device selector
-            ui.label("Output:");
-            // Determine current from the actual engine to prevent any visual desync
-            let current = {
-                let engine = self.engine.lock();
-                if let Some(ref e) = *engine {
-                    e.device_name.clone()
-                } else if self.available_devices.is_empty() {
-                    "No devices".to_string()
-                } else {
-                    "Select...".to_string()
+                ui.label("Output:");
+                let current = {
+                    let engine = self.engine.lock();
+                    if let Some(ref e) = *engine {
+                        e.device_name.clone()
+                    } else if self.available_devices.is_empty() {
+                        "No devices".to_string()
+                    } else {
+                        "Select...".to_string()
+                    }
+                };
+
+                if let Some(idx) = self.available_devices.iter().position(|d| d == &current) {
+                    self.selected_device_idx = idx;
                 }
-            };
-            
-            // Sync selected_device_idx in case engine changed
-            if let Some(idx) = self.available_devices.iter().position(|d| d == &current) {
-                self.selected_device_idx = idx;
-            }
 
-            let device_response =
-                egui::ComboBox::from_id_salt("device_selector")
+                let device_width = ui.available_width().clamp(180.0, 250.0);
+                let device_response = egui::ComboBox::from_id_salt("device_selector")
                     .selected_text(&current)
-                    .width(250.0)
+                    .width(device_width)
                     .show_ui(ui, |ui| {
                         let mut changed = false;
                         for (i, dev) in self.available_devices.iter().enumerate() {
                             let is_cable = dev.to_lowercase().contains("cable");
                             let label = if is_cable {
-                                egui::RichText::new(format!("🔌 {}", dev))
+                                egui::RichText::new(format!("Cable: {}", dev))
                                     .color(egui::Color32::from_rgb(100, 220, 100))
                             } else {
                                 egui::RichText::new(dev.as_str())
@@ -183,156 +219,168 @@ impl SoundboardApp {
                         changed
                     });
 
-            if let Some(inner) = device_response.inner {
-                if inner {
-                    if let Some(name) = self.available_devices.get(self.selected_device_idx).cloned()
-                    {
-                        self.switch_device(&name);
+                if let Some(inner) = device_response.inner {
+                    if inner {
+                        if let Some(name) = self
+                            .available_devices
+                            .get(self.selected_device_idx)
+                            .cloned()
+                        {
+                            self.switch_device(&name);
+                        }
                     }
                 }
-            }
 
-            ui.separator();
-
-            // Master volume
-            ui.label("Virtual Vol:");
-            let vol_slider = ui.add(
-                egui::Slider::new(&mut self.config.master_volume, 0.0..=2.0)
-                    .show_value(true)
-                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                    .clamping(egui::SliderClamping::Always),
-            );
-            if vol_slider.changed() {
-                self.needs_save = true;
-                if let Some(ref engine) = *self.engine.lock() {
-                    engine.update_global_volumes(self.config.master_volume, self.config.local_volume);
-                }
-            }
-
-            ui.separator();
-
-            if ui.checkbox(&mut self.config.play_locally, "🎧 Echo to Speakers").changed() {
-                self.needs_save = true;
-            }
-
-            if self.config.play_locally {
-                ui.add_space(4.0);
-                ui.label("Local Vol:");
-                let lvol_slider = ui.add(
-                    egui::Slider::new(&mut self.config.local_volume, 0.0..=2.0)
+                ui.separator();
+                ui.label("Virtual Vol:");
+                let vol_slider = ui.add_sized(
+                    [120.0, 22.0],
+                    egui::Slider::new(&mut self.config.master_volume, 0.0..=2.0)
                         .show_value(true)
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                         .clamping(egui::SliderClamping::Always),
                 );
-                if lvol_slider.changed() {
+                if vol_slider.changed() {
                     self.needs_save = true;
                     if let Some(ref engine) = *self.engine.lock() {
-                        engine.update_global_volumes(self.config.master_volume, self.config.local_volume);
+                        engine.update_global_volumes(
+                            self.config.master_volume,
+                            self.config.local_volume,
+                        );
                     }
                 }
-            }
 
-            ui.separator();
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.config.play_locally, "Echo to Speakers")
+                    .changed()
+                {
+                    self.needs_save = true;
+                }
 
-            // Stop all button
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("⏹ Stop All")
-                            .color(egui::Color32::from_rgb(255, 100, 100)),
+                if self.config.play_locally {
+                    ui.label("Local Vol:");
+                    let lvol_slider = ui.add_sized(
+                        [120.0, 22.0],
+                        egui::Slider::new(&mut self.config.local_volume, 0.0..=2.0)
+                            .show_value(true)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                            .clamping(egui::SliderClamping::Always),
+                    );
+                    if lvol_slider.changed() {
+                        self.needs_save = true;
+                        if let Some(ref engine) = *self.engine.lock() {
+                            engine.update_global_volumes(
+                                self.config.master_volume,
+                                self.config.local_volume,
+                            );
+                        }
+                    }
+                }
+
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Stop All")
+                                .color(egui::Color32::from_rgb(255, 100, 100)),
+                        )
+                        .min_size(egui::vec2(86.0, 28.0)),
                     )
-                    .min_size(egui::vec2(90.0, 28.0)),
-                )
-                .clicked()
-            {
-                self.stop_all();
-            }
+                    .clicked()
+                {
+                    self.stop_all();
+                }
+            });
 
-            // Spacer
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Search
-                ui.add(
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Search:");
+                ui.add_sized(
+                    [ui.available_width(), 24.0],
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("🔍 Search sounds...")
-                        .desired_width(180.0),
+                        .hint_text("Search sounds..."),
                 );
             });
         });
     }
 
     fn render_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let num_tabs = self.config.folders.len();
-            for i in 0..num_tabs {
-                let name = self.config.folders[i].name.clone();
-                let is_active = self.config.active_tab == i;
+        egui::ScrollArea::horizontal()
+            .id_salt("tabs_scroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let num_tabs = self.config.folders.len();
+                    for i in 0..num_tabs {
+                        let name = self.config.folders[i].name.clone();
+                        let is_active = self.config.active_tab == i;
 
-                let btn = if is_active {
-                    egui::Button::new(
-                        egui::RichText::new(&name)
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(egui::Color32::from_rgb(80, 60, 180))
-                    .corner_radius(egui::CornerRadius::same(6))
-                } else {
-                    egui::Button::new(
-                        egui::RichText::new(&name)
-                            .color(egui::Color32::from_rgb(180, 180, 200)),
-                    )
-                    .fill(egui::Color32::from_rgb(40, 40, 55))
-                    .corner_radius(egui::CornerRadius::same(6))
-                };
+                        let btn = if is_active {
+                            egui::Button::new(
+                                egui::RichText::new(&name)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(80, 60, 180))
+                            .corner_radius(egui::CornerRadius::same(6))
+                        } else {
+                            egui::Button::new(
+                                egui::RichText::new(&name)
+                                    .color(egui::Color32::from_rgb(180, 180, 200)),
+                            )
+                            .fill(egui::Color32::from_rgb(40, 40, 55))
+                            .corner_radius(egui::CornerRadius::same(6))
+                        };
 
-                let response = ui.add(btn.min_size(egui::vec2(80.0, 30.0)));
-                if response.clicked() {
-                    self.config.active_tab = i;
-                    self.needs_save = true;
-                }
-
-                // Right-click to remove tab
-                response.context_menu(|ui| {
-                    if ui.button("🔄 Refresh").clicked() {
-                        self.config.folders[i].refresh();
-                        self.needs_save = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("❌ Remove Tab").clicked() {
-                        self.config.folders.remove(i);
-                        if self.config.active_tab >= self.config.folders.len()
-                            && !self.config.folders.is_empty()
-                        {
-                            self.config.active_tab = self.config.folders.len() - 1;
+                        let response = ui.add(btn.min_size(egui::vec2(80.0, 30.0)));
+                        if response.clicked() {
+                            self.config.active_tab = i;
+                            self.needs_save = true;
                         }
-                        self.needs_save = true;
-                        ui.close_menu();
+
+                        response.context_menu(|ui| {
+                            if ui.button("Refresh").clicked() {
+                                self.config.folders[i].refresh();
+                                self.needs_save = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("Remove Tab").clicked() {
+                                self.config.folders.remove(i);
+                                if self.config.active_tab >= self.config.folders.len()
+                                    && !self.config.folders.is_empty()
+                                {
+                                    self.config.active_tab = self.config.folders.len() - 1;
+                                }
+                                self.needs_save = true;
+                                ui.close_menu();
+                            }
+                        });
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(" + ")
+                                    .size(16.0)
+                                    .color(egui::Color32::from_rgb(100, 220, 100)),
+                            )
+                            .fill(egui::Color32::from_rgb(35, 50, 35))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .min_size(egui::vec2(40.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            let tab = FolderTab::from_directory(&folder);
+                            log::info!("Added folder: {} ({} sounds)", tab.name, tab.sounds.len());
+                            self.config.active_tab = self.config.folders.len();
+                            self.config.folders.push(tab);
+                            self.needs_save = true;
+                        }
                     }
                 });
-            }
-
-            // Add folder button
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("  +  ")
-                            .size(16.0)
-                            .color(egui::Color32::from_rgb(100, 220, 100)),
-                    )
-                    .fill(egui::Color32::from_rgb(35, 50, 35))
-                    .corner_radius(egui::CornerRadius::same(6))
-                    .min_size(egui::vec2(40.0, 30.0)),
-                )
-                .clicked()
-            {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    let tab = FolderTab::from_directory(&folder);
-                    log::info!("Added folder: {} ({} sounds)", tab.name, tab.sounds.len());
-                    self.config.active_tab = self.config.folders.len();
-                    self.config.folders.push(tab);
-                    self.needs_save = true;
-                }
-            }
-        });
+            });
     }
 
     fn render_sound_grid(&mut self, ui: &mut egui::Ui) {
@@ -354,13 +402,17 @@ impl SoundboardApp {
             return;
         }
 
-        let tab_idx = self.config.active_tab.min(self.config.folders.len().saturating_sub(1));
+        let tab_idx = self
+            .config
+            .active_tab
+            .min(self.config.folders.len().saturating_sub(1));
 
-        // Get filtered sounds
         let sounds: Vec<SoundEntry> = {
             let tab = &self.config.folders[tab_idx];
-            let filtered = filter_sounds(&tab.sounds, &self.search_query);
-            filtered.into_iter().cloned().collect()
+            filter_sounds(&tab.sounds, &self.search_query)
+                .into_iter()
+                .cloned()
+                .collect()
         };
 
         if sounds.is_empty() {
@@ -381,36 +433,41 @@ impl SoundboardApp {
             return;
         }
 
-        // Get currently playing sounds for highlight
-        let playing_names: Vec<String> = {
+        let playback_infos: Vec<PlaybackInfo> = {
             let engine = self.engine.lock();
             engine
                 .as_ref()
-                .map(|e| e.currently_playing())
+                .map(|e| e.playback_snapshot())
                 .unwrap_or_default()
         };
 
-        let available_width = ui.available_width();
-        let tile_width = 200.0_f32;
-        let cols = ((available_width / tile_width) as usize).max(1);
+        let spacing = 8.0_f32;
+        let min_tile_width = 300.0_f32;
+        let available_width = ui.available_width().max(1.0);
+        let cols =
+            (((available_width + spacing) / (min_tile_width + spacing)).floor() as usize).max(1);
+        let tile_width = if cols == 1 {
+            available_width
+        } else {
+            ((available_width - spacing * (cols.saturating_sub(1) as f32)) / cols as f32).floor()
+        };
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("sound_grid")
-                    .num_columns(cols)
-                    .spacing(egui::vec2(8.0, 8.0))
-                    .min_col_width(tile_width)
-                    .show(ui, |ui| {
-                        for (i, sound) in sounds.iter().enumerate() {
-                            if i > 0 && i % cols == 0 {
-                                ui.end_row();
-                            }
-
-                            let is_playing = playing_names.contains(&sound.name);
-                            self.render_sound_tile(ui, sound, tab_idx, is_playing);
-                        }
-                    });
+                ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+                ui.horizontal_wrapped(|ui| {
+                    for sound in sounds.iter() {
+                        let playback = playback_infos.iter().find(|info| info.name == sound.name);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(tile_width, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                self.render_sound_tile(ui, sound, tab_idx, playback, tile_width);
+                            },
+                        );
+                    }
+                });
             });
     }
 
@@ -419,8 +476,10 @@ impl SoundboardApp {
         ui: &mut egui::Ui,
         sound: &SoundEntry,
         tab_idx: usize,
-        is_playing: bool,
+        playback: Option<&PlaybackInfo>,
+        tile_width: f32,
     ) {
+        let is_playing = playback.is_some();
         let bg_color = if is_playing {
             egui::Color32::from_rgb(45, 35, 80)
         } else {
@@ -440,88 +499,163 @@ impl SoundboardApp {
                 },
             ));
 
+        let inner_width = (tile_width - 24.0).max(120.0);
         frame.show(ui, |ui| {
-            ui.set_min_width(176.0);
-            ui.set_max_width(200.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.vertical(|ui| {
+                ui.set_min_width(inner_width);
+                ui.set_max_width(inner_width);
 
-            // Sound name
-            let name_color = if is_playing {
-                egui::Color32::from_rgb(180, 150, 255)
-            } else {
-                egui::Color32::from_rgb(220, 220, 240)
-            };
-
-            ui.label(
-                egui::RichText::new(&sound.name)
-                    .color(name_color)
-                    .strong()
-                    .size(13.0),
-            );
-
-            ui.horizontal(|ui| {
-                // Play button
-                let play_text = if is_playing { "⏹" } else { "▶" };
-                let play_color = if is_playing {
-                    egui::Color32::from_rgb(255, 100, 100)
+                let name_color = if is_playing {
+                    egui::Color32::from_rgb(180, 150, 255)
                 } else {
-                    egui::Color32::from_rgb(100, 220, 100)
+                    egui::Color32::from_rgb(220, 220, 240)
                 };
 
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(play_text).color(play_color).size(16.0),
-                        )
-                        .min_size(egui::vec2(32.0, 26.0)),
+                ui.add_sized(
+                    [inner_width, 20.0],
+                    egui::Label::new(
+                        egui::RichText::new(&sound.name)
+                            .color(name_color)
+                            .strong()
+                            .size(13.0),
                     )
-                    .clicked()
-                {
-                    if is_playing {
-                        let engine = self.engine.lock();
-                        if let Some(ref e) = *engine {
-                            e.stop_by_name(&sound.name);
-                        }
+                    .truncate(),
+                )
+                .on_hover_text(&sound.name);
+
+                ui.horizontal(|ui| {
+                    let play_text = if is_playing { "Stop" } else { "Play" };
+                    let play_color = if is_playing {
+                        egui::Color32::from_rgb(255, 100, 100)
                     } else {
-                        self.play_sound(sound);
+                        egui::Color32::from_rgb(100, 220, 100)
+                    };
+
+                    if ui
+                        .add_sized(
+                            [52.0, 26.0],
+                            egui::Button::new(
+                                egui::RichText::new(play_text).color(play_color).size(13.0),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        if is_playing {
+                            let engine = self.engine.lock();
+                            if let Some(ref e) = *engine {
+                                e.stop_by_name(&sound.name);
+                            }
+                        } else {
+                            self.play_sound(sound);
+                        }
+                    }
+
+                    let sound_name = sound.name.clone();
+                    let mut vol = sound.volume;
+                    let slider_width = ui.available_width().max(64.0);
+                    let slider = ui.add_sized(
+                        [slider_width, 22.0],
+                        egui::Slider::new(&mut vol, 0.0..=2.0)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always),
+                    );
+                    if slider.changed() {
+                        if let Some(tab) = self.config.folders.get_mut(tab_idx) {
+                            if let Some(s) = tab.sounds.iter_mut().find(|s| s.name == sound_name) {
+                                s.volume = vol;
+                                self.needs_save = true;
+                            }
+                        }
+                        if let Some(ref engine) = *self.engine.lock() {
+                            engine.update_sound_volume(
+                                &sound_name,
+                                vol,
+                                self.config.master_volume,
+                                self.config.local_volume,
+                            );
+                        }
+                    }
+                });
+
+                if let Some(playback) = playback {
+                    ui.add_space(4.0);
+                    if let Some(duration) = playback.duration.filter(|d| !d.is_zero()) {
+                        let duration_secs = duration.as_secs_f64();
+                        let mut position_secs = playback.position.min(duration).as_secs_f64();
+                        let time_label = format!(
+                            "{} / {}",
+                            Self::format_duration(playback.position.min(duration)),
+                            Self::format_duration(duration)
+                        );
+
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized([32.0, 24.0], egui::Button::new("<<"))
+                                .on_hover_text("Rewind 5 seconds")
+                                .clicked()
+                            {
+                                self.jump_sound(&sound.name, false);
+                            }
+
+                            let progress_width =
+                                (inner_width - 72.0 - ui.spacing().item_spacing.x * 2.0).max(80.0);
+                            let response = ui
+                                .add_sized(
+                                    [progress_width, 22.0],
+                                    egui::Slider::new(&mut position_secs, 0.0..=duration_secs)
+                                        .show_value(false)
+                                        .clamping(egui::SliderClamping::Always),
+                                )
+                                .on_hover_text("Drag to seek");
+                            if response.changed() {
+                                self.seek_sound_to(&sound.name, position_secs);
+                            }
+
+                            if ui
+                                .add_sized([32.0, 24.0], egui::Button::new(">>"))
+                                .on_hover_text("Fast forward 5 seconds")
+                                .clicked()
+                            {
+                                self.jump_sound(&sound.name, true);
+                            }
+                        });
+
+                        ui.add_sized(
+                            [inner_width, 14.0],
+                            egui::Label::new(
+                                egui::RichText::new(time_label)
+                                    .size(10.0)
+                                    .color(egui::Color32::from_rgb(120, 120, 155)),
+                            )
+                            .truncate(),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / unknown duration",
+                                Self::format_duration(playback.position)
+                            ))
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(120, 120, 155)),
+                        );
                     }
                 }
 
-                // Volume slider (per-sound)
-                let sound_name = sound.name.clone();
-                let mut vol = sound.volume;
-                let slider = ui.add(
-                    egui::Slider::new(&mut vol, 0.0..=2.0)
-                        .show_value(false)
-                        .clamping(egui::SliderClamping::Always),
-                );
-                if slider.changed() {
-                    // Update volume in the folder tab
-                    if let Some(tab) = self.config.folders.get_mut(tab_idx) {
-                        if let Some(s) = tab.sounds.iter_mut().find(|s| s.name == sound_name) {
-                            s.volume = vol;
-                            self.needs_save = true;
-                        }
-                    }
-                    if let Some(ref engine) = *self.engine.lock() {
-                        engine.update_sound_volume(&sound_name, vol, self.config.master_volume, self.config.local_volume);
-                    }
+                if let Some(ref hk) = sound.hotkey {
+                    ui.label(
+                        egui::RichText::new(format!("Key: {}", hk))
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(100, 100, 140)),
+                    );
                 }
             });
-
-            // Hotkey badge
-            if let Some(ref hk) = sound.hotkey {
-                ui.label(
-                    egui::RichText::new(format!("⌨ {}", hk))
-                        .size(10.0)
-                        .color(egui::Color32::from_rgb(100, 100, 140)),
-                );
-            }
         });
     }
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // Currently playing
+        ui.horizontal_wrapped(|ui| {
             let playing = {
                 let engine = self.engine.lock();
                 engine
@@ -537,79 +671,71 @@ impl SoundboardApp {
                         .color(egui::Color32::from_rgb(90, 90, 110)),
                 );
             } else {
-                ui.label(
-                    egui::RichText::new(format!("▶ Playing: {}", playing.join(", ")))
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(140, 120, 255)),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("Playing: {}", playing.join(", ")))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(140, 120, 255)),
+                    )
+                    .truncate(),
                 );
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.status_message.is_empty() {
-                    ui.label(
-                        egui::RichText::new(&self.status_message)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(120, 120, 140)),
-                    );
-                }
+            if !self.status_message.is_empty() {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(&self.status_message)
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(120, 120, 140)),
+                );
+            }
 
-                // Device indicator
-                let engine = self.engine.lock();
-                if let Some(ref e) = *engine {
-                    let dev_display = if e.device_name.to_lowercase().contains("cable") {
-                        format!("🔌 {}", e.device_name)
-                    } else {
-                        format!("🔈 {}", e.device_name)
-                    };
-                    ui.label(
-                        egui::RichText::new(dev_display)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(90, 130, 90)),
-                    );
-                }
-            });
+            let engine = self.engine.lock();
+            if let Some(ref e) = *engine {
+                ui.separator();
+                let dev_display = if e.device_name.to_lowercase().contains("cable") {
+                    format!("Cable: {}", e.device_name)
+                } else {
+                    e.device_name.clone()
+                };
+                ui.label(
+                    egui::RichText::new(dev_display)
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(90, 130, 90)),
+                );
+            }
         });
     }
 }
 
 impl eframe::App for SoundboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check for keyboard shortcuts
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.stop_all();
         }
 
-        // Top panel - controls
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(18, 18, 28))
                     .inner_margin(egui::Margin::same(10))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(40, 40, 60),
-                    )),
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 60))),
             )
             .show(ctx, |ui| {
                 self.render_top_bar(ui);
             });
 
-        // Bottom panel - status bar
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(15, 15, 22))
                     .inner_margin(egui::Margin::symmetric(10, 5))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(35, 35, 50),
-                    )),
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 35, 50))),
             )
             .show(ctx, |ui| {
                 self.render_status_bar(ui);
             });
 
-        // Central panel
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -617,33 +743,27 @@ impl eframe::App for SoundboardApp {
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
-                // Tab bar
                 self.render_tabs(ui);
-
                 ui.add_space(8.0);
-
                 ui.separator();
-
                 ui.add_space(8.0);
-
-                // Sound grid
                 self.render_sound_grid(ui);
             });
 
-        // Auto-save on changes
         if self.needs_save {
             self.config.save();
             self.needs_save = false;
         }
 
-        // Request repaint while sounds are playing (for UI updates)
-        {
+        let has_playing_sounds = {
             let engine = self.engine.lock();
-            if let Some(ref e) = *engine {
-                if !e.currently_playing().is_empty() {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                }
-            }
+            engine
+                .as_ref()
+                .map(|e| !e.currently_playing().is_empty())
+                .unwrap_or(false)
+        };
+        if has_playing_sounds {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 

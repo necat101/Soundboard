@@ -20,8 +20,12 @@ pub struct AppConfig {
     pub window_height: f32,
 }
 
-fn default_true() -> bool { true }
-fn default_volume() -> f32 { 1.0 }
+fn default_true() -> bool {
+    true
+}
+fn default_volume() -> f32 {
+    1.0
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
